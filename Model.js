@@ -1,281 +1,386 @@
-// Pure presentation logic for Vitals. No QML imports, no side effects:
-// everything here is a plain function over plain data so the same code runs
-// under Quickshell's JS engine and under `node test/model.test.js`.
-//
-// Levels: "normal" < "elevated" < "critical". The panel maps them to the
-// theme's foreground, accent, and urgent colors respectively.
-
-var LEVELS = ["normal", "elevated", "critical"]
-var TEMP_WARN_C = 85
-var TEMP_CRIT_C = 95
-
-function clamp(value, low, high) {
+function clamp(value, lo, hi) {
   var n = Number(value)
-  if (!isFinite(n)) return low
-  return Math.max(low, Math.min(high, n))
+  if (!isFinite(n)) return lo
+  return Math.max(lo, Math.min(hi, n))
 }
 
-// ---------------------------------------------------------------- formatting
+function isOn(value, fallback) {
+  if (value === undefined || value === null || value === "") return !!fallback
+  if (typeof value === "boolean") return value
+  var s = String(value).replace(/^\s+|\s+$/g, "").toLowerCase()
+  if (s === "on" || s === "true" || s === "1" || s === "yes") return true
+  if (s === "off" || s === "false" || s === "0" || s === "no") return false
+  return !!fallback
+}
 
-function formatBytes(bytes) {
+function fileUrlToPath(url) {
+  var s = String(url || "")
+  if (s.indexOf("file://") === 0) s = s.substring(7)
+  try {
+    return decodeURIComponent(s)
+  } catch (e) {
+    return s
+  }
+}
+
+function emptySnapshot() {
+  return {
+    ok: false,
+    ts: 0,
+    cpu: { percent: null, tempC: null, load1: null, load5: null, load15: null, cores: 0 },
+    memory: { percent: null, usedBytes: 0, totalBytes: 0, availableBytes: 0, swapUsedBytes: 0, swapTotalBytes: 0 },
+    gpus: [],
+    disks: [],
+    network: { rxBytes: 0, txBytes: 0, rxRate: 0, txRate: 0 },
+    temps: [],
+    hottest: null
+  }
+}
+
+function emptyExtras() {
+  return {
+    ok: false,
+    processes: { cpu: [], memory: [], gpu: [] },
+    directories: {}
+  }
+}
+
+function parseSnapshot(raw) {
+  var text = String(raw || "").replace(/^\s+|\s+$/g, "")
+  if (!text) return null
+  try {
+    var data = JSON.parse(text)
+    if (!data || typeof data !== "object") return null
+    if (!data.cpu) data.cpu = emptySnapshot().cpu
+    if (!data.memory) data.memory = emptySnapshot().memory
+    if (!Array.isArray(data.gpus)) data.gpus = []
+    if (!Array.isArray(data.disks)) data.disks = []
+    if (!data.network) data.network = emptySnapshot().network
+    if (!Array.isArray(data.temps)) data.temps = []
+    return data
+  } catch (e) {
+    return null
+  }
+}
+
+function primaryGpu(snapshot) {
+  var gpus = snapshot && snapshot.gpus ? snapshot.gpus : []
+  return gpus.length > 0 ? gpus[0] : null
+}
+
+function diskForMount(snapshot, mount) {
+  var disks = snapshot && snapshot.disks ? snapshot.disks : []
+  var wanted = String(mount || "/")
+  var i
+  for (i = 0; i < disks.length; i++) {
+    if (disks[i] && disks[i].mount === wanted) return disks[i]
+  }
+  if (wanted !== "/" ) {
+    for (i = 0; i < disks.length; i++) {
+      if (disks[i] && disks[i].mount === "/") return disks[i]
+    }
+  }
+  return disks.length > 0 ? disks[0] : null
+}
+
+function formatPercent(value, emptyText) {
+  if (value === undefined || value === null || !isFinite(Number(value))) return emptyText || "—"
+  return Math.round(Number(value)) + "%"
+}
+
+function formatProcessPercent(value, emptyText) {
+  if (value === undefined || value === null || !isFinite(Number(value))) return emptyText || "—"
+  var n = Number(value)
+  if (n < 10) return n.toFixed(1) + "%"
+  return Math.round(n) + "%"
+}
+
+function formatTemp(celsius, unit, emptyText) {
+  if (celsius === undefined || celsius === null || !isFinite(Number(celsius))) return emptyText || "—"
+  var c = Number(celsius)
+  if (String(unit || "C").toUpperCase().indexOf("F") === 0) return Math.round(c * 9 / 5 + 32) + "°"
+  return Math.round(c) + "°"
+}
+
+function formatTempFull(celsius, unit, emptyText) {
+  if (celsius === undefined || celsius === null || !isFinite(Number(celsius))) return emptyText || "—"
+  var c = Number(celsius)
+  if (String(unit || "C").toUpperCase().indexOf("F") === 0) return Math.round(c * 9 / 5 + 32) + "°F"
+  return Math.round(c) + "°C"
+}
+
+function formatBytes(bytes, emptyText) {
   var n = Number(bytes)
-  if (!isFinite(n) || n <= 0) return "0 B"
-  var units = ["B", "KB", "MB", "GB", "TB", "PB"]
-  var i = 0
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
-  var text = (i === 0 || n >= 100) ? String(Math.round(n)) : String(Math.round(n * 10) / 10)
-  return text + " " + units[i]
+  if (!isFinite(n) || n < 0) return emptyText || "—"
+  var value = n
+  var unit = "B"
+  if (n >= 1024) { value = n / 1024; unit = "KB" }
+  if (n >= 1024 * 1024) { value = n / (1024 * 1024); unit = "MB" }
+  if (n >= 1024 * 1024 * 1024) { value = n / (1024 * 1024 * 1024); unit = "GB" }
+  if (n >= 1024 * 1024 * 1024 * 1024) { value = n / (1024 * 1024 * 1024 * 1024); unit = "TB" }
+  if (unit === "B" || unit === "KB" || unit === "MB") return Math.round(value) + " " + unit
+  var rounded = value >= 10 ? value.toFixed(1) : value.toFixed(2)
+  return String(Number(rounded)) + " " + unit
 }
 
-function formatRate(bytesPerSecond) {
-  return formatBytes(bytesPerSecond) + "/s"
+function formatRate(bytesPerSec, emptyText) {
+  if (bytesPerSec === undefined || bytesPerSec === null) return emptyText || "—"
+  var n = Number(bytesPerSec)
+  if (!isFinite(n) || n < 0) return emptyText || "—"
+  if (n < 1024) return Math.round(n) + " B/s"
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB/s"
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB/s"
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB/s"
 }
 
-function formatFreq(mhz) {
-  var n = Number(mhz)
-  if (!isFinite(n) || n <= 0) return "—"
-  if (n >= 1000) return (Math.round(n / 100) / 10).toFixed(1) + " GHz"
-  return Math.round(n) + " MHz"
+function formatLoad(value) {
+  if (value === undefined || value === null || !isFinite(Number(value))) return "—"
+  return Number(value).toFixed(2)
 }
 
-function formatTemp(celsius, unit) {
-  var n = Number(celsius)
-  if (celsius === null || celsius === undefined || !isFinite(n)) return "—"
-  if (String(unit || "C").toUpperCase() === "F") return Math.round(n * 9 / 5 + 32) + "°F"
-  return Math.round(n) + "°C"
+// Format GPU used VRAM as "X GB" (always GB, never MB)
+function formatGpuUsed(gpu) {
+  if (!gpu) return "—"
+  var u = Number(gpu.memUsedBytes)
+  if (!isFinite(u) || u < 0) return "—"
+  return (u / (1024 * 1024 * 1024)).toFixed(1) + " GB"
 }
 
-function formatUptime(seconds) {
-  var s = Math.max(0, Math.floor(Number(seconds) || 0))
-  var days = Math.floor(s / 86400)
-  var hours = Math.floor((s % 86400) / 3600)
-  var minutes = Math.floor((s % 3600) / 60)
-  if (days > 0) return days + "d " + hours + "h"
-  if (hours > 0) return hours + "h " + minutes + "m"
-  return minutes + "m"
-}
-
-function formatPercent(percent) {
-  return Math.round(clamp(percent, 0, 100)) + "%"
-}
-
-function formatLoad(load) {
-  if (!load || !load.length) return ""
-  return (Math.round(Number(load[0]) * 100) / 100).toFixed(2)
-}
-
-// "12th Gen Intel(R) Core(TM) i7-1260P" -> "Intel Core i7-1260P"
-function shortCpuModel(model) {
-  var s = String(model || "")
-  s = s.replace(/\((R|TM|C)\)/gi, "")
-  s = s.replace(/\b\d+(st|nd|rd|th) Gen\b/i, "")
-  s = s.replace(/\b(CPU|Processor)\b/gi, "")
-  s = s.replace(/@.*$/, "")
-  s = s.replace(/\b(w\/|with)\s+.*$/i, "")
-  s = s.replace(/\b\d+-Core\b/i, "")
-  return s.replace(/\s+/g, " ").trim()
-}
-
-// "Intel Core i7-1260P" -> "i7-1260P"; the hero line has one row to spend.
-function compactCpuModel(model) {
-  return shortCpuModel(model).replace(/^(Intel Core|Intel|AMD)\s+/i, "")
-}
-
-// ------------------------------------------------------------------- levels
-
-function levelIndex(level) {
-  var i = LEVELS.indexOf(level)
-  return i < 0 ? 0 : i
-}
-
-function maxLevel(a, b) {
-  return LEVELS[Math.max(levelIndex(a), levelIndex(b))]
-}
-
-function levelFor(percent, warn, crit) {
-  var p = Number(percent)
-  if (!isFinite(p)) return "normal"
-  if (p >= Number(crit)) return "critical"
-  if (p >= Number(warn)) return "elevated"
-  return "normal"
-}
-
-function tempLevel(celsius) {
-  if (celsius === null || celsius === undefined) return "normal"
-  return levelFor(celsius, TEMP_WARN_C, TEMP_CRIT_C)
-}
-
-function overallLevel(doc, warn, crit) {
-  var d = doc || {}
-  var cpu = d.cpu || {}
-  var memory = d.memory || {}
-  var level = levelFor(cpu.percent, warn, crit)
-  level = maxLevel(level, levelFor(memory.percent, warn, crit))
-  level = maxLevel(level, tempLevel(cpu.tempC))
-  return level
-}
-
-// Per-core meters sit up to sixteen to a row; beyond that, rows are balanced.
-function meterColumns(count) {
-  var n = Math.max(0, Math.floor(Number(count) || 0))
-  if (n <= 16) return n
-  return Math.ceil(n / Math.ceil(n / 16))
-}
-
-function busiestCore(cores) {
-  var list = cores || []
-  var best = -1, index = -1
-  for (var i = 0; i < list.length; i++) {
-    var v = Number(list[i])
-    if (isFinite(v) && v > best) { best = v; index = i }
-  }
-  return index < 0 ? null : { index: index, percent: best }
-}
-
-// Label for the per-core disclosure row: "16 cores · busiest 42%" while the
-// meters are hidden, just the count once they are showing.
-function coresSummary(cores, expanded) {
-  var list = cores || []
-  var text = list.length + (list.length === 1 ? " core" : " cores")
-  if (expanded) return text
-  var busiest = busiestCore(list)
-  return busiest ? text + " · busiest " + formatPercent(busiest.percent) : text
-}
-
-// ------------------------------------------------------------------ history
-
-// Append a sample and drop everything older than the window.
-function pushHistory(history, t, value, windowSec) {
-  var time = Number(t)
-  if (!isFinite(time)) return history || []
-  var out = []
-  var cutoff = time - Number(windowSec)
-  var src = history || []
-  for (var i = 0; i < src.length; i++) {
-    if (src[i].t >= cutoff && src[i].t <= time) out.push(src[i])
-  }
-  out.push({ t: time, v: clamp(value, 0, 100) })
-  return out
-}
-
-// Map history onto a width x height box, newest sample at the right edge.
-// `pad` keeps the 0% and 100% lines inside the box.
-function sparklinePoints(history, width, height, windowSec, pad) {
-  var src = history || []
-  var w = Number(width), h = Number(height), p = Number(pad) || 0
-  if (src.length === 0 || !(w > 0) || !(h > 0)) return []
-  var now = src[src.length - 1].t
-  var start = now - Number(windowSec)
-  var inner = Math.max(0, h - 2 * p)
-  var out = []
-  for (var i = 0; i < src.length; i++) {
-    var x = clamp((src[i].t - start) / Number(windowSec), 0, 1) * w
-    var y = p + (1 - clamp(src[i].v, 0, 100) / 100) * inner
-    out.push({ x: x, y: y })
-  }
-  return out
-}
-
-// Close a polyline down to the baseline so it can be filled.
-function sparklineArea(points, height) {
-  if (!points || points.length < 2) return []
-  var h = Number(height) || 0
-  var out = [{ x: points[0].x, y: h }]
-  for (var i = 0; i < points.length; i++) out.push(points[i])
-  out.push({ x: points[points.length - 1].x, y: h })
-  return out
-}
-
-// ------------------------------------------------------------ panel strings
-
-function hostLine(doc) {
-  var d = doc || {}
-  var host = d.host || {}
-  var parts = []
-  var model = compactCpuModel(host.cpuModel)
-  if (model) parts.push(model)
-  if (host.threads > 0) parts.push(host.threads + " threads")
-  if (d.uptimeSec > 0) parts.push("up " + formatUptime(d.uptimeSec))
-  return parts.join(" · ")
-}
-
-function cpuDetail(cpu, unit) {
-  var c = cpu || {}
-  var parts = []
-  if (c.freqMhz > 0) parts.push(formatFreq(c.freqMhz))
-  if (c.tempC !== null && c.tempC !== undefined) parts.push(formatTemp(c.tempC, unit))
-  var load = formatLoad(c.load)
-  if (load) parts.push("load " + load)
-  return parts.join(" · ")
-}
-
-function memoryDetail(memory) {
-  var m = memory || {}
-  if (!(m.totalBytes > 0)) return ""
-  return formatBytes(m.usedBytes) + " of " + formatBytes(m.totalBytes)
-}
-
-function swapDetail(memory) {
-  var m = memory || {}
-  if (!(m.swapTotalBytes > 0)) return ""
-  return formatBytes(m.swapUsedBytes) + " of " + formatBytes(m.swapTotalBytes)
-}
-
-// Fractions of the memory bar: `used` is drawn solid, `cached` is the
-// translucent segment that follows it. Both are clamped so they never overrun.
-function memoryFractions(memory) {
-  var m = memory || {}
-  var total = Number(m.totalBytes)
-  if (!(total > 0)) return { used: 0, cached: 0 }
-  var used = clamp(Number(m.usedBytes) / total, 0, 1)
-  var cached = clamp(Number(m.cachedBytes) / total, 0, 1 - used)
-  return { used: Math.round(used * 10000) / 10000, cached: Math.round(cached * 10000) / 10000 }
-}
-
-function gpuDetail(gpu, unit) {
-  var g = gpu || {}
-  var parts = []
-  if (g.freqMhz > 0) parts.push(formatFreq(g.freqMhz) + (g.maxFreqMhz > 0 ? " of " + formatFreq(g.maxFreqMhz) : ""))
-  else if (g.maxFreqMhz > 0) parts.push((g.freqMhz === 0 ? "clock parked · " : "") + formatFreq(g.maxFreqMhz) + " max")
-  if (g.vramTotalBytes > 0 && g.vramUsedBytes !== null && g.vramUsedBytes !== undefined) parts.push(formatBytes(g.vramUsedBytes) + " of " + formatBytes(g.vramTotalBytes))
-  if (g.tempC !== null && g.tempC !== undefined) parts.push(formatTemp(g.tempC, unit))
-  return parts.join(" · ")
-}
-
-function storageValue(disk) {
-  var d = disk || {}
-  return formatBytes(d.freeBytes) + " free"
-}
-
-function storageDetail(disk) {
-  var d = disk || {}
-  return "of " + formatBytes(d.totalBytes) + " · " + Math.round(Number(d.percent) || 0) + "% used"
-}
-
-function hasPid(processes, pid, startTime) {
-  var list = processes || []
-  for (var i = 0; i < list.length; i++) {
-    if (list[i].pid === pid && list[i].startTime === startTime) return true
+function metricWarned(kind, snapshot, warnPercent, warnTempC) {
+  var cpu = snapshot && snapshot.cpu ? snapshot.cpu : {}
+  var memory = snapshot && snapshot.memory ? snapshot.memory : {}
+  var gpu = primaryGpu(snapshot)
+  var disk = diskForMount(snapshot, "/")
+  if (kind === "cpu") return Number(cpu.percent) >= warnPercent || Number(cpu.tempC) >= warnTempC
+  if (kind === "memory") return Number(memory.percent) >= warnPercent
+  if (kind === "gpu") return !!(gpu && (Number(gpu.percent) >= warnPercent || Number(gpu.tempC) >= warnTempC))
+  if (kind === "disk") return !!(disk && Number(disk.percent) >= warnPercent)
+  if (kind === "temp") {
+    var hottest = snapshot && snapshot.hottest ? snapshot.hottest.celsius : null
+    return Number(hottest) >= warnTempC
   }
   return false
 }
 
-function signalArgs(helper, mode, pid, startTime) {
-  return [helper, "--signal", mode === "kill" ? "kill" : "term", String(pid), "--start-time", String(startTime)]
+function anyWarned(snapshot, warnPercent, warnTempC) {
+  return metricWarned("cpu", snapshot, warnPercent, warnTempC)
+    || metricWarned("memory", snapshot, warnPercent, warnTempC)
+    || metricWarned("gpu", snapshot, warnPercent, warnTempC)
+    || metricWarned("disk", snapshot, warnPercent, warnTempC)
+    || metricWarned("temp", snapshot, warnPercent, warnTempC)
 }
 
-if (typeof module !== "undefined" && module.exports) {
+function statusPhrase(snapshot, warnPercent, warnTempC) {
+  if (!snapshot || snapshot.ok === false && !snapshot.cpu) return "Waiting for sensors"
+  var cpu = snapshot.cpu || {}
+  var memory = snapshot.memory || {}
+  var gpu = primaryGpu(snapshot)
+  var hottest = snapshot.hottest ? Number(snapshot.hottest.celsius) : NaN
+  if (isFinite(hottest) && hottest >= warnTempC) return "Running hot"
+  if (Number(cpu.percent) >= warnPercent || Number(memory.percent) >= warnPercent || (gpu && Number(gpu.percent) >= warnPercent))
+    return "Under load"
+  if (Number(cpu.percent) >= 70 || Number(memory.percent) >= 70 || (gpu && Number(gpu.percent) >= 70) || (isFinite(hottest) && hottest >= warnTempC - 10))
+    return "Working hard"
+  return "Running cool"
+}
+
+function visibleMetrics(settings, snapshot) {
+  var display = String((settings && settings.display) || "All")
+  var showCpu = isOn(settings && settings.showCpu, true)
+  var showMemory = isOn(settings && settings.showMemory, true)
+  var showGpu = isOn(settings && settings.showGpu, true)
+  var showDisk = isOn(settings && settings.showDisk, false)
+  var showNetwork = isOn(settings && settings.showNetwork, true)
+  var showTemp = isOn(settings && settings.showTemp, true)
+  var diskMount = (settings && settings.diskMount) || "/"
+  var unit = (settings && settings.tempUnit) || "C"
+  var compact = isOn(settings && settings.compact, false)
+  var useText = String((settings && settings.barStyle) || "Icons") === "Text"
+  var cpu = snapshot && snapshot.cpu ? snapshot.cpu : {}
+  var memory = snapshot && snapshot.memory ? snapshot.memory : {}
+  var gpu = primaryGpu(snapshot)
+  var disk = diskForMount(snapshot, diskMount)
+  var network = snapshot && snapshot.network ? snapshot.network : {}
+  var hottest = snapshot && snapshot.hottest ? snapshot.hottest : null
+  var items = []
+
+  function markFor(kind, glyph) {
+    if (!useText) return glyph
+    if (kind === "cpu") return "CPU"
+    if (kind === "memory") return "MEM"
+    if (kind === "gpu") return "GPU"
+    if (kind === "disk") return "DISK"
+    if (kind === "network") return "NET"
+    if (kind === "temp") return "TEMP"
+    return glyph
+  }
+
+  function push(kind, icon, value, detail, available) {
+    if (!available) return
+    if (display !== "All" && display.toLowerCase() !== kind) return
+    items.push({
+      kind: kind,
+      icon: markFor(kind, icon),
+      useText: useText,
+      value: value,
+      detail: detail || "",
+      text: compact || !detail ? value : (value + " " + detail)
+    })
+  }
+
+  if (display === "CPU" || display === "Memory" || display === "GPU" || display === "Disk" || display === "Network" || display === "Temp") {
+    showCpu = display === "CPU"
+    showMemory = display === "Memory"
+    showGpu = display === "GPU"
+    showDisk = display === "Disk"
+    showNetwork = display === "Network"
+    showTemp = display === "Temp"
+  }
+
+  if (showCpu) {
+    push(
+      "cpu",
+      "󰍛",
+      formatPercent(cpu.percent),
+      showTemp && display === "All" && !compact ? formatTemp(cpu.tempC, unit) : "",
+      true
+    )
+  }
+  if (showMemory) {
+    push("memory", "󰘚", formatPercent(memory.percent), "", true)
+  }
+  if (showGpu) {
+    push(
+      "gpu",
+      "󰢮",
+      formatPercent(gpu ? gpu.percent : null),
+      (showTemp && display === "All" && !compact && gpu)
+        ? (formatTemp(gpu.tempC, unit) + "  " + formatGpuUsed(gpu))
+        : formatGpuUsed(gpu),
+      !!gpu
+    )
+  }
+  if (showDisk) {
+    push("disk", "󰋊", formatPercent(disk ? disk.percent : null), compact ? "" : formatBytes(disk.totalBytes), !!disk)
+  }
+  if (showNetwork) {
+    var hasNet = network.rxRate !== undefined || network.txRate !== undefined
+    var netText = "↓" + formatRate(network.rxRate || 0) + "  ↑" + formatRate(network.txRate || 0)
+    push("network", "󰈀", netText, "", hasNet)
+  }
+  if (showTemp && display === "Temp") {
+    push("temp", "󰔏", formatTemp(hottest ? hottest.celsius : (cpu.tempC), unit), "", true)
+  }
+  return items
+}
+
+function tooltipLines(snapshot, settings) {
+  var unit = (settings && settings.tempUnit) || "C"
+  var cpu = snapshot && snapshot.cpu ? snapshot.cpu : {}
+  var memory = snapshot && snapshot.memory ? snapshot.memory : {}
+  var gpu = primaryGpu(snapshot)
+  var disk = diskForMount(snapshot, (settings && settings.diskMount) || "/")
+  var network = snapshot && snapshot.network ? snapshot.network : {}
+  var lines = []
+  lines.push("CPU  " + formatPercent(cpu.percent) + "  " + formatTempFull(cpu.tempC, unit))
+  lines.push("RAM  " + formatPercent(memory.percent) + "  " + formatBytes(memory.usedBytes) + " / " + formatBytes(memory.totalBytes))
+  if (gpu) {
+    var vram = ""
+    if (gpu.memUsedBytes && gpu.memTotalBytes)
+      vram = "  " + formatBytes(gpu.memUsedBytes) + " / " + formatBytes(gpu.memTotalBytes)
+    lines.push("GPU  " + formatPercent(gpu.percent) + "  " + formatTempFull(gpu.tempC, unit) + vram)
+  }
+  if (disk) lines.push("Disk " + formatPercent(disk.percent) + "  " + disk.mount + "  " + formatBytes(disk.totalBytes))
+  if (network.rxRate !== undefined || network.txRate !== undefined) {
+    lines.push("NET  ↓" + formatRate(network.rxRate || 0) + "  ↑" + formatRate(network.txRate || 0))
+  }
+  return lines.join("\n")
+}
+
+function verticalLines(items) {
+  var lines = []
+  for (var i = 0; i < (items || []).length; i++) lines.push(items[i].value)
+  return lines
+}
+
+function parseExtras(raw) {
+  var text = String(raw || "").replace(/^\s+|\s+$/g, "")
+  if (!text) return null
+  try {
+    var data = JSON.parse(text)
+    if (!data || typeof data !== "object") return null
+    if (!data.processes) data.processes = emptyExtras().processes
+    if (!data.processes.cpu) data.processes.cpu = []
+    if (!data.processes.memory) data.processes.memory = []
+    if (!data.processes.gpu) data.processes.gpu = []
+    if (!data.directories || typeof data.directories !== "object") data.directories = {}
+    return data
+  } catch (e) {
+    return null
+  }
+}
+
+function namedRows(list, valueKey, formatter) {
+  var rows = []
+  var items = list || []
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i] || {}
+    var name = String(item.name || item.label || "")
+    if (!name) continue
+    rows.push({ name: name, value: formatter(item[valueKey]) })
+  }
+  return rows
+}
+
+function processCpuRows(extras) {
+  return namedRows(extras && extras.processes ? extras.processes.cpu : [], "percent", formatProcessPercent)
+}
+
+function processMemoryRows(extras) {
+  return namedRows(extras && extras.processes ? extras.processes.memory : [], "bytes", formatBytes)
+}
+
+function processGpuRows(extras) {
+  return namedRows(extras && extras.processes ? extras.processes.gpu : [], "bytes", formatBytes)
+}
+
+function directoryRows(extras, mount) {
+  var dirs = extras && extras.directories ? extras.directories : {}
+  var entry = dirs[mount || "/"] || dirs["/"] || null
+  if (!entry) return []
+  var rows = namedRows(entry.items, "bytes", formatBytes)
+  if (rows.length === 0 && entry.scanning) return [{ name: "Measuring…", value: "" }]
+  return rows
+}
+
+if (typeof module !== "undefined") {
   module.exports = {
-    LEVELS: LEVELS, TEMP_WARN_C: TEMP_WARN_C, TEMP_CRIT_C: TEMP_CRIT_C,
-    clamp: clamp, formatBytes: formatBytes, formatRate: formatRate, formatFreq: formatFreq,
-    formatTemp: formatTemp, formatUptime: formatUptime, formatPercent: formatPercent,
-    formatLoad: formatLoad, shortCpuModel: shortCpuModel, compactCpuModel: compactCpuModel,
-    levelIndex: levelIndex, maxLevel: maxLevel, levelFor: levelFor, tempLevel: tempLevel,
-    overallLevel: overallLevel, meterColumns: meterColumns,
-    busiestCore: busiestCore, coresSummary: coresSummary,
-    pushHistory: pushHistory, sparklinePoints: sparklinePoints, sparklineArea: sparklineArea,
-    hostLine: hostLine, cpuDetail: cpuDetail, memoryDetail: memoryDetail, swapDetail: swapDetail,
-    memoryFractions: memoryFractions, gpuDetail: gpuDetail, storageValue: storageValue,
-    storageDetail: storageDetail, hasPid: hasPid, signalArgs: signalArgs
+    clamp: clamp,
+    isOn: isOn,
+    fileUrlToPath: fileUrlToPath,
+    emptySnapshot: emptySnapshot,
+    emptyExtras: emptyExtras,
+    parseSnapshot: parseSnapshot,
+    parseExtras: parseExtras,
+    processCpuRows: processCpuRows,
+    processMemoryRows: processMemoryRows,
+    processGpuRows: processGpuRows,
+    directoryRows: directoryRows,
+    primaryGpu: primaryGpu,
+    diskForMount: diskForMount,
+    formatPercent: formatPercent,
+    formatProcessPercent: formatProcessPercent,
+    formatTemp: formatTemp,
+    formatTempFull: formatTempFull,
+    formatBytes: formatBytes,
+    formatRate: formatRate,
+    formatLoad: formatLoad,
+    formatGpuUsed: formatGpuUsed,
+    metricWarned: metricWarned,
+    anyWarned: anyWarned,
+    statusPhrase: statusPhrase,
+    visibleMetrics: visibleMetrics,
+    tooltipLines: tooltipLines,
+    verticalLines: verticalLines
   }
 }
